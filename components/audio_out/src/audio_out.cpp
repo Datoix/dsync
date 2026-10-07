@@ -1,6 +1,5 @@
 #include "audio_out.hpp"
 
-#include "board.hpp"
 #include "esp_check.h"
 #include "esp_log.h"
 
@@ -9,63 +8,14 @@ namespace {
 
 constexpr char TAG[] = "audio_out";
 
-/** Ring capacity and prefetch cushion (bytes of PCM). */
 constexpr size_t kRingBytes = 32 * 1024;
 constexpr size_t kPrefetchBytes = 20 * 1024;
-/** Max bytes pulled from the ring per I2S write. */
 constexpr size_t kChunkBytes = 240 * 6;
 
 }  // namespace
 
-void Output::write_task (void *arg) {
-    auto *self = static_cast<Output *>(arg);
-
-    for (;;) {
-        // Sleep until write() signals prefetch is ready (or resume after underrun).
-        if (xSemaphoreTake(self->_wake_sem.get(), portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-
-        for (;;) {
-            size_t item_size = 0;
-            auto *data = static_cast<uint8_t *>(xRingbufferReceiveUpTo(
-                self->_ringbuf.get(),
-                &item_size,
-                pdMS_TO_TICKS(20),
-                kChunkBytes));
-
-            if (item_size == 0) {
-                ESP_LOGI(TAG, "ring underflow -> prefetch");
-                self->_ring_mode = RingMode::Prefetching;
-                break;
-            }
-
-            if (self->_chan_st == ChanState::Enabled) {
-                size_t written = 0;
-                (void)i2s_channel_write(
-                    self->_tx_chan.get(),
-                    data,
-                    item_size,
-                    &written,
-                    portMAX_DELAY);
-            }
-            vRingbufferReturnItem(self->_ringbuf.get(), data);
-        }
-    }
-}
-
-esp_err_t Output::open () {
-    if (_chan_st != ChanState::Idle) {
-        ESP_LOGW(TAG, "already open");
-        return ESP_OK;
-    }
-
-    const auto pins = dsync::board::i2s_pins();
-
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.auto_clear = true;
-
-    i2s_std_config_t std_cfg = {
+i2s_std_config_t Output::make_std_config (const dsync::board::I2sPins &pins) {
+    return i2s_std_config_t {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(44100),
         .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
@@ -81,6 +31,71 @@ esp_err_t Output::open () {
             },
         },
     };
+}
+
+void Output::disable_i2s () {
+    if (_tx_chan) {
+        (void)i2s_channel_disable(_tx_chan.get());
+    }
+}
+
+size_t Output::ring_bytes_used () const {
+    size_t used = 0;
+    if (_ringbuf) {
+        vRingbufferGetInfo(_ringbuf.get(), nullptr, nullptr, nullptr, nullptr, &used);
+    }
+    return used;
+}
+
+void Output::drain_to_i2s () {
+    for (;;) {
+        size_t item_size = 0;
+        auto *data = static_cast<uint8_t *>(xRingbufferReceiveUpTo(
+            _ringbuf.get(),
+            &item_size,
+            pdMS_TO_TICKS(20),
+            kChunkBytes));
+
+        if (item_size == 0) {
+            ESP_LOGI(TAG, "ring underflow -> prefetch");
+            _ring_mode = RingMode::Prefetching;
+            return;
+        }
+
+        if (_chan_st == ChanState::Enabled) {
+            size_t written = 0;
+            (void)i2s_channel_write(
+                _tx_chan.get(),
+                data,
+                item_size,
+                &written,
+                portMAX_DELAY);
+        }
+        vRingbufferReturnItem(_ringbuf.get(), data);
+    }
+}
+
+void Output::write_task (void *arg) {
+    auto *self = static_cast<Output *>(arg);
+
+    for (;;) {
+        if (xSemaphoreTake(self->_wake_sem.get(), portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        self->drain_to_i2s();
+    }
+}
+
+esp_err_t Output::open () {
+    if (_chan_st != ChanState::Idle) {
+        ESP_LOGW(TAG, "already open");
+        return ESP_OK;
+    }
+
+    const auto pins = dsync::board::i2s_pins();
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    const i2s_std_config_t std_cfg = make_std_config(pins);
 
     i2s_chan_handle_t raw = nullptr;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &raw, nullptr), TAG, "i2s_new_channel");
@@ -104,6 +119,41 @@ void Output::close () {
     }
 }
 
+esp_err_t Output::ensure_wake_sem () {
+    if (_wake_sem) {
+        return ESP_OK;
+    }
+    _wake_sem.reset(xSemaphoreCreateBinary());
+    return _wake_sem ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+esp_err_t Output::ensure_ring () {
+    if (_ringbuf) {
+        return ESP_OK;
+    }
+    _ringbuf.reset(xRingbufferCreate(kRingBytes, RINGBUF_TYPE_BYTEBUF));
+    return _ringbuf ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+esp_err_t Output::ensure_writer_task () {
+    if (_write_task) {
+        return ESP_OK;
+    }
+
+    TaskHandle_t raw = nullptr;
+    if (xTaskCreate(
+            write_task,
+            "i2s_wr",
+            4 * 1024,
+            this,
+            configMAX_PRIORITIES - 3,
+            &raw) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    _write_task.reset(raw);
+    return ESP_OK;
+}
+
 esp_err_t Output::start () {
     if (_chan_st != ChanState::Opened) {
         ESP_LOGE(TAG, "start: wrong state %d", static_cast<int>(_chan_st));
@@ -113,33 +163,9 @@ esp_err_t Output::start () {
     ESP_RETURN_ON_ERROR(i2s_channel_enable(_tx_chan.get()), TAG, "i2s_enable");
     _ring_mode = RingMode::Prefetching;
 
-    if (!_wake_sem) {
-        _wake_sem.reset(xSemaphoreCreateBinary());
-        if (!_wake_sem) {
-            (void)i2s_channel_disable(_tx_chan.get());
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (!_ringbuf) {
-        _ringbuf.reset(xRingbufferCreate(kRingBytes, RINGBUF_TYPE_BYTEBUF));
-        if (!_ringbuf) {
-            (void)i2s_channel_disable(_tx_chan.get());
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (!_write_task) {
-        TaskHandle_t raw = nullptr;
-        if (xTaskCreate(
-                write_task,
-                "i2s_wr",
-                4 * 1024,
-                this,
-                configMAX_PRIORITIES - 3,
-                &raw) != pdPASS) {
-            (void)i2s_channel_disable(_tx_chan.get());
-            return ESP_ERR_NO_MEM;
-        }
-        _write_task.reset(raw);
+    if (ensure_wake_sem() != ESP_OK || ensure_ring() != ESP_OK || ensure_writer_task() != ESP_OK) {
+        disable_i2s();
+        return ESP_ERR_NO_MEM;
     }
 
     _chan_st = ChanState::Enabled;
@@ -147,10 +173,11 @@ esp_err_t Output::start () {
 }
 
 void Output::stop () {
-    if (_chan_st == ChanState::Enabled && _tx_chan) {
-        (void)i2s_channel_disable(_tx_chan.get());
-        _chan_st = ChanState::Opened;
+    if (_chan_st != ChanState::Enabled || !_tx_chan) {
+        return;
     }
+    disable_i2s();
+    _chan_st = ChanState::Opened;
 }
 
 esp_err_t Output::configure_pcm (uint32_t sample_rate_hz, int channel_count) {
@@ -179,17 +206,30 @@ esp_err_t Output::configure_pcm (uint32_t sample_rate_hz, int channel_count) {
     return ESP_OK;
 }
 
+void Output::on_drop_mode () {
+    if (ring_bytes_used() <= kPrefetchBytes) {
+        _ring_mode = RingMode::Processing;
+    }
+}
+
+void Output::maybe_finish_prefetch () {
+    if (_ring_mode != RingMode::Prefetching) {
+        return;
+    }
+    if (ring_bytes_used() < kPrefetchBytes) {
+        return;
+    }
+    _ring_mode = RingMode::Processing;
+    (void)xSemaphoreGive(_wake_sem.get());
+}
+
 size_t Output::write (const uint8_t *data, size_t size) {
     if (!_ringbuf || !data || size == 0) {
         return 0;
     }
 
     if (_ring_mode == RingMode::Dropping) {
-        size_t used = 0;
-        vRingbufferGetInfo(_ringbuf.get(), nullptr, nullptr, nullptr, nullptr, &used);
-        if (used <= kPrefetchBytes) {
-            _ring_mode = RingMode::Processing;
-        }
+        on_drop_mode();
         return 0;
     }
 
@@ -198,15 +238,7 @@ size_t Output::write (const uint8_t *data, size_t size) {
         return 0;
     }
 
-    if (_ring_mode == RingMode::Prefetching) {
-        size_t used = 0;
-        vRingbufferGetInfo(_ringbuf.get(), nullptr, nullptr, nullptr, nullptr, &used);
-        if (used >= kPrefetchBytes) {
-            _ring_mode = RingMode::Processing;
-            (void)xSemaphoreGive(_wake_sem.get());
-        }
-    }
-
+    maybe_finish_prefetch();
     return size;
 }
 

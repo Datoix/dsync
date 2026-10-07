@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "board.hpp"
+#include "driver/i2s_std.h"
 #include "esp_err.h"
 #include "idf_handles.hpp"
 
@@ -36,9 +38,21 @@ private:
 
     static void write_task (void *arg);
 
+    void drain_to_i2s ();
+    void disable_i2s ();
+    size_t ring_bytes_used () const;
+    void on_drop_mode ();
+    void maybe_finish_prefetch ();
+
+    esp_err_t ensure_wake_sem ();
+    esp_err_t ensure_ring ();
+    esp_err_t ensure_writer_task ();
+
+    static i2s_std_config_t make_std_config (const dsync::board::I2sPins &pins);
+
     handles::I2sChan _tx_chan;
     handles::Ringbuf _ringbuf;
-    handles::Sem _wake_sem;   // binary: wake writer after prefetch
+    handles::Sem _wake_sem;
     handles::Task _write_task;
 
     ChanState _chan_st = ChanState::Idle;

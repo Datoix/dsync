@@ -7,8 +7,16 @@ namespace dsync::ui {
 namespace {
 
 constexpr char TAG[] = "ui_leds";
-/** Periodic blink base tick (ms). Patterns are multiples of this. */
+
+/** Periodic blink base period (microseconds). Patterns are multiples of this. */
 constexpr uint64_t kTickUs = 50 * 1000ULL;
+
+/** Playing: 100 ms on / 100 ms off → 2 ticks each → period 4. */
+constexpr uint32_t kPlayingHalfTicks = 2;
+/** Discoverable: 500 ms on / 500 ms off → 10 ticks each. */
+constexpr uint32_t kDiscoverableHalfTicks = 10;
+/** Idle: short pulse every 2 s → 1 of 40 ticks. */
+constexpr uint32_t kIdlePeriodTicks = 40;
 
 }  // namespace
 
@@ -22,15 +30,12 @@ bool Leds::level_for_tick (Status st, uint32_t tick) const {
     case Status::Connected:
         return true;
     case Status::Playing:
-        // 100 ms on / 100 ms off → 2 ticks each
-        return ((tick / 2) % 2) == 0;
+        return ((tick / kPlayingHalfTicks) % 2) == 0;
     case Status::Discoverable:
-        // 500 ms on / 500 ms off → 10 ticks each
-        return ((tick / 10) % 2) == 0;
+        return ((tick / kDiscoverableHalfTicks) % 2) == 0;
     case Status::Idle:
     default:
-        // short pulse every 2 s → on for 1 of 40 ticks
-        return (tick % 40) == 0;
+        return (tick % kIdlePeriodTicks) == 0;
     }
 }
 
@@ -45,7 +50,7 @@ void Leds::timer_cb (void *arg) {
     self->apply_level(self->level_for_tick(st, tick));
 }
 
-esp_err_t Leds::init () {
+void Leds::init_gpio () {
     const auto pins = dsync::board::led_pins();
     _gpio = static_cast<gpio_num_t>(pins.gpio);
     _active_level = pins.active_level;
@@ -59,7 +64,9 @@ esp_err_t Leds::init () {
     };
     ESP_ERROR_CHECK(gpio_config(&cfg));
     apply_level(false);
+}
 
+esp_err_t Leds::start_timer () {
     esp_timer_handle_t raw = nullptr;
     const esp_timer_create_args_t targs = {
         .callback = &Leds::timer_cb,
@@ -70,10 +77,15 @@ esp_err_t Leds::init () {
     };
     ESP_ERROR_CHECK(esp_timer_create(&targs, &raw));
     _timer.reset(raw);
+    return esp_timer_start_periodic(_timer.get(), kTickUs);
+}
+
+esp_err_t Leds::init () {
+    init_gpio();
 
     _status.store(Status::Idle, std::memory_order_relaxed);
     _tick.store(0, std::memory_order_relaxed);
-    ESP_ERROR_CHECK(esp_timer_start_periodic(_timer.get(), kTickUs));
+    ESP_ERROR_CHECK(start_timer());
 
     ESP_LOGI(TAG, "LED on GPIO %d", static_cast<int>(_gpio));
     return ESP_OK;

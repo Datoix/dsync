@@ -38,15 +38,35 @@ struct Sink {
         return _audio;
     }
 
+    dsync::ui::Leds &leds () {
+        return _leds;
+    }
+
     /** Post an A2DP control event from the stack callback (non-blocking). */
     void post_a2d_event (uint16_t event, const void *param, size_t param_size);
+
+    /** Called from the worker after StackUp is posted. */
+    void on_stack_up ();
+
+    /** Dispatch one A2DP control event on the worker task. */
+    void handle_a2d_event (uint16_t event, void *param);
 
 private:
     static void work_task (void *arg);
 
     esp_err_t init_controller ();
-    void on_stack_up ();
-    void handle_a2d_event (uint16_t event, void *param);
+    esp_err_t init_nvs ();
+    esp_err_t enable_controller ();
+    esp_err_t enable_bluedroid ();
+    void configure_pairing ();
+    void log_bd_addr ();
+
+    void on_connection (void *param);
+    void on_audio_state (void *param);
+    void on_audio_cfg (void *param);
+
+    esp_err_t start_worker ();
+    esp_err_t post_stack_up ();
 
     dsync::audio::Output &_audio;
     dsync::ui::Leds &_leds;

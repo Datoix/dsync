@@ -31,6 +31,8 @@ private:
 
     void apply_level (bool on);
     bool level_for_tick (Status st, uint32_t tick) const;
+    void init_gpio ();
+    esp_err_t start_timer ();
 
     gpio_num_t _gpio = GPIO_NUM_NC;
     int _active_level = 1;

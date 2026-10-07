@@ -8,7 +8,7 @@ components/
   board/                  Kconfig pin getters
   idf_handles/            unique_ptr wrappers for IDF/FreeRTOS C handles
   audio_out/              I2S TX + ringbuffer + i2s_wr task
-  bt_sink/                Classic Bluedroid A2DP sink
+  bt_sink/                Classic A2DP sink (bt_sink / bt_controller / bt_a2dp)
   ui_leds/                status LED (atomic status + periodic timer)
 ```
 
