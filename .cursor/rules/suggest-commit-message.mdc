@@ -1,0 +1,10 @@
+---
+description: Suggest a commit message after changes
+alwaysApply: true
+---
+
+# Suggest commit message
+
+After code/doc changes (unless user asked to commit / said not to): check `git status` + `git log -5 --oneline`, then suggest one short message for **pending** changes only—do not commit.
+
+Use **scoped** conventional commits: `type(scope): summary` (e.g. `feat(wifi): …`, `fix(i2c): …`, `docs(readme): …`). Match recent `git log` for type/scope wording; common types: `feat` / `fix` / `refactor` / `docs` / `build`.

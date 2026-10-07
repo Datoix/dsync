@@ -1,0 +1,12 @@
+---
+description: Push back on questionable requests before acting
+alwaysApply: true
+---
+
+# Validate before following
+
+Before doing what the user asks (or proposing a change), briefly check whether it is a good fit for this ESP-IDF codebase.
+
+If it looks doubtful, suboptimal, or cargo-cult (e.g. a nested `CMakeLists.txt` that is not a real IDF component, Arduino APIs in an IDF project, blocking work in an ISR)—**do not implement it yet**. Say why it may be a bad idea, suggest the better default if you have one, and ask them to confirm they still want it.
+
+Only proceed after they explicitly confirm, or when the request is clearly sound.

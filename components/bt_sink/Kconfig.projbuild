@@ -1,0 +1,16 @@
+menu "dsync Bluetooth"
+
+    config DSYNC_BT_DEVICE_NAME
+        string "Bluetooth device name"
+        default "dsync"
+        help
+            Name shown when pairing from a phone.
+
+    config DSYNC_BT_SSP_ENABLED
+        bool "Secure Simple Pairing"
+        default y
+        depends on BT_CLASSIC_ENABLED
+        help
+            If disabled, Bluedroid uses legacy PIN pairing (1234).
+
+endmenu

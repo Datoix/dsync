@@ -1,0 +1,32 @@
+menu "dsync board"
+
+    config DSYNC_I2S_BCK_GPIO
+        int "I2S BCK GPIO"
+        default 26
+        help
+            Bit clock to PCM5102A.
+
+    config DSYNC_I2S_LRCK_GPIO
+        int "I2S LRCK (WS) GPIO"
+        default 22
+        help
+            Word select / LRCK to PCM5102A.
+
+    config DSYNC_I2S_DOUT_GPIO
+        int "I2S DOUT GPIO"
+        default 25
+        help
+            Data out to PCM5102A DIN.
+
+    config DSYNC_LED_GPIO
+        int "Status LED GPIO"
+        default 2
+        help
+            Onboard LED on ESP32 DevKit V1 (GPIO2). Remap for PCB LEDs later.
+
+    config DSYNC_LED_ACTIVE_LEVEL
+        int "Status LED active level (1=high, 0=low)"
+        default 1
+        range 0 1
+
+endmenu
