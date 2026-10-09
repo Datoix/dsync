@@ -51,7 +51,7 @@ void Leds::timer_cb (void *arg) {
 }
 
 void Leds::init_gpio () {
-    const auto pins = dsync::board::led_pins();
+    const auto &pins = dsync::board::kPins.led;
     _gpio = static_cast<gpio_num_t>(pins.gpio);
     _active_level = pins.active_level;
 

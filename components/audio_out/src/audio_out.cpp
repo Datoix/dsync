@@ -14,7 +14,7 @@ constexpr size_t kChunkBytes = 240 * 6;
 
 }  // namespace
 
-i2s_std_config_t Output::make_std_config (const dsync::board::I2sPins &pins) {
+i2s_std_config_t Output::make_std_config (const dsync::board::DacPins &pins) {
     return i2s_std_config_t {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(44100),
         .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
@@ -92,7 +92,9 @@ esp_err_t Output::open () {
         return ESP_OK;
     }
 
-    const auto pins = dsync::board::i2s_pins();
+    const auto &pins = dsync::board::kPins.dac;
+    ESP_RETURN_ON_ERROR(pins.apply_mode(), TAG, "dac_mode");
+
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
     const i2s_std_config_t std_cfg = make_std_config(pins);

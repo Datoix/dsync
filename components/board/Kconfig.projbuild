@@ -4,7 +4,7 @@ menu "dsync board"
         int "I2S BCK GPIO"
         default 26
         help
-            Bit clock to PCM5102A.
+            Bit clock to PCM5102A. Default matches Espressif a2dp_sink example.
 
     config DSYNC_I2S_LRCK_GPIO
         int "I2S LRCK (WS) GPIO"
@@ -17,6 +17,30 @@ menu "dsync board"
         default 25
         help
             Data out to PCM5102A DIN.
+
+    config DSYNC_PCM5102_FMT_GPIO
+        int "PCM5102A FMT GPIO"
+        default 27
+        help
+            Format select. Firmware drives LOW = I2S (required).
+
+    config DSYNC_PCM5102_XSMT_GPIO
+        int "PCM5102A XSMT GPIO"
+        default 32
+        help
+            Soft mute. Firmware drives HIGH = unmute.
+
+    config DSYNC_PCM5102_DEMP_GPIO
+        int "PCM5102A DEMP GPIO"
+        default 33
+        help
+            De-emphasis. Firmware drives LOW = off.
+
+    config DSYNC_PCM5102_FLT_GPIO
+        int "PCM5102A FLT GPIO"
+        default 4
+        help
+            FIR filter select. Firmware drives LOW = normal latency.
 
     config DSYNC_LED_GPIO
         int "Status LED GPIO"

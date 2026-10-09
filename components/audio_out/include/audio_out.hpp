@@ -48,7 +48,7 @@ private:
     esp_err_t ensure_ring ();
     esp_err_t ensure_writer_task ();
 
-    static i2s_std_config_t make_std_config (const dsync::board::I2sPins &pins);
+    static i2s_std_config_t make_std_config (const dsync::board::DacPins &pins);
 
     handles::I2sChan _tx_chan;
     handles::Ringbuf _ringbuf;

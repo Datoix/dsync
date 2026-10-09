@@ -11,9 +11,16 @@ CONFIG_BT_A2DP_USE_EXTERNAL_CODEC=n
 # Device name (also Kconfig in bt_sink; defaults align)
 CONFIG_DSYNC_BT_DEVICE_NAME="dsync"
 
-# I2S / LED defaults for ESP32 DevKit V1 + PCM5102A
+# I2S — Espressif a2dp_sink example defaults (remappable in menuconfig)
 CONFIG_DSYNC_I2S_BCK_GPIO=26
 CONFIG_DSYNC_I2S_LRCK_GPIO=22
 CONFIG_DSYNC_I2S_DOUT_GPIO=25
+
+# PCM5102A mode pins (wire instead of soldering jumpers; firmware sets levels)
+CONFIG_DSYNC_PCM5102_FMT_GPIO=27
+CONFIG_DSYNC_PCM5102_XSMT_GPIO=32
+CONFIG_DSYNC_PCM5102_DEMP_GPIO=33
+CONFIG_DSYNC_PCM5102_FLT_GPIO=4
+
 CONFIG_DSYNC_LED_GPIO=2
 CONFIG_DSYNC_LED_ACTIVE_LEVEL=1
