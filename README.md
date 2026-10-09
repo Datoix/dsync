@@ -14,7 +14,7 @@ ESP32 Bluetooth A2DP sink → I2S DAC (PCM5102A) → headphone jack.
 ## Build
 
 ```bash
-. $HOME/.espressif/v6.1/esp-idf/export.sh
+. $HOME/.espressif/tools/activate_idf_v6.1.sh
 idf.py set-target esp32
 idf.py build
 idf.py -p PORT flash monitor
