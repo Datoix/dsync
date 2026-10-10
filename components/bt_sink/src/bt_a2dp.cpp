@@ -16,6 +16,15 @@ constexpr char TAG[] = "bt_a2dp";
 /** Reported A2DP render delay (1/10 ms units) added to the stack default. */
 constexpr uint32_t kAppDelayTenthMs = 50;
 
+/**
+ * ACL packet types to allow on an A2DP link. The controller's default set is too
+ * narrow for some sources (Linux/BlueZ), which then collapse the media stream to
+ * about one packet per second. 0xFF1E is the set proven to fix it — the host-side
+ * equivalent is `hcitool cmd 0x01 0x000f <handle> 0x1e 0xff`, i.e. HCI 0x040F
+ * (Change_Connection_Packet_Type).
+ */
+constexpr esp_bt_acl_pkt_type_t kAclPktTypes = 0xFF1E;
+
 uint32_t sbc_sample_rate (const esp_a2d_mcc_t &mcc) {
     if (mcc.cie.sbc_info.samp_freq & ESP_A2D_SBC_CIE_SF_48K) {
         return 48000;
@@ -61,6 +70,16 @@ void gap_cb (esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
         ESP_LOGW(TAG, "ssp passkey requested");
         return;
 #endif
+    case ESP_BT_GAP_ACL_PKT_TYPE_CHANGED_EVT: {
+        char bda_str[18] = {};
+        ESP_LOGI(
+            TAG,
+            "acl pkt types stat=%d peer=%s types=0x%04x",
+            param->set_acl_pkt_types.status,
+            bda2str(param->set_acl_pkt_types.bda, bda_str, sizeof(bda_str)),
+            static_cast<unsigned>(param->set_acl_pkt_types.pkt_types));
+        return;
+    }
     default:
         return;
     }
@@ -112,6 +131,15 @@ void Sink::on_connection (void *param) {
 
     if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
         esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+
+        // Widen the ACL packet types; the controller default is too narrow for
+        // some sources, which then stall the media stream.
+        const esp_err_t pkt_err =
+            esp_bt_gap_set_acl_pkt_types(a2d->conn_stat.remote_bda, kAclPktTypes);
+        if (pkt_err != ESP_OK) {
+            ESP_LOGW(TAG, "set_acl_pkt_types failed: %s", esp_err_to_name(pkt_err));
+        }
+
         _leds.set_status(dsync::ui::Status::Connected);
     }
 }
