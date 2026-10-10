@@ -34,9 +34,9 @@ esp_err_t DacPins::apply_mode () const {
     ESP_RETURN_ON_ERROR(drive_out(xsmt, kXsmtLevel), TAG, "XSMT");
     ESP_RETURN_ON_ERROR(drive_out(demp, kDempLevel), TAG, "DEMP");
     ESP_RETURN_ON_ERROR(drive_out(flt, kFltLevel), TAG, "FLT");
-    ESP_LOGI(
+    ESP_LOGD(
         TAG,
-        "DAC mode FMT=%d:0 XSMT=%d:1 DEMP=%d:0 FLT=%d:0",
+        "dac mode FMT=%d XSMT=%d DEMP=%d FLT=%d",
         fmt,
         xsmt,
         demp,

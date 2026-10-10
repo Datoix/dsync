@@ -1,5 +1,7 @@
 #include "audio_out.hpp"
 
+#include <cinttypes>
+
 #include "esp_check.h"
 #include "esp_log.h"
 
@@ -11,8 +13,33 @@ constexpr char TAG[] = "audio_out";
 constexpr size_t kRingBytes = 32 * 1024;
 constexpr size_t kPrefetchBytes = 20 * 1024;
 constexpr size_t kChunkBytes = 240 * 6;
+constexpr TickType_t kStatsPeriodTicks = pdMS_TO_TICKS(1000);
 
 }  // namespace
+
+const char *Output::phase_str (I2sPhase p) {
+    switch (p) {
+    case I2sPhase::Closed:
+        return "closed";
+    case I2sPhase::Open:
+        return "open";
+    case I2sPhase::Running:
+        return "running";
+    }
+    return "?";
+}
+
+const char *Output::ring_str (RingMode m) {
+    switch (m) {
+    case RingMode::Prefetching:
+        return "prefetch";
+    case RingMode::Processing:
+        return "play";
+    case RingMode::Dropping:
+        return "drop";
+    }
+    return "?";
+}
 
 i2s_std_config_t Output::make_std_config (const dsync::board::DacPins &pins) {
     return i2s_std_config_t {
@@ -47,6 +74,61 @@ size_t Output::ring_bytes_used () const {
     return used;
 }
 
+void Output::reset_stream_stats () {
+    _stats_tick = xTaskGetTickCount();
+    _win_bytes_in = 0;
+    _win_bytes_drop = 0;
+    _win_underflows = 0;
+}
+
+void Output::note_write (size_t offered, size_t accepted) {
+    if (accepted < offered) {
+        _win_bytes_drop += static_cast<uint32_t>(offered - accepted);
+    }
+    _win_bytes_in += static_cast<uint32_t>(accepted);
+    maybe_log_stream();
+}
+
+void Output::note_underflow () {
+    ++_win_underflows;
+    ++_total_underflows;
+}
+
+void Output::maybe_log_stream () {
+    const TickType_t now = xTaskGetTickCount();
+    if (_stats_tick == 0) {
+        _stats_tick = now;
+        return;
+    }
+    if ((now - _stats_tick) < kStatsPeriodTicks) {
+        return;
+    }
+
+    const uint32_t expect = expect_pcm_bps();
+    const uint32_t ring = static_cast<uint32_t>(ring_bytes_used());
+    ESP_LOGI(
+        TAG,
+        "stream in=%" PRIu32 "B/s drop=%" PRIu32 "B/s expect=%" PRIu32
+        "B/s (%" PRIu32 "Hz ch=%d) ring=%" PRIu32 "/%u uf=%" PRIu32
+        "/%" PRIu32 " i2s=%s ring_mode=%s vol=n/a",
+        _win_bytes_in,
+        _win_bytes_drop,
+        expect,
+        _sample_rate_hz,
+        _channel_count,
+        ring,
+        static_cast<unsigned>(kRingBytes),
+        _win_underflows,
+        _total_underflows,
+        phase_str(_i2s_phase),
+        ring_str(_ring_mode));
+
+    _stats_tick = now;
+    _win_bytes_in = 0;
+    _win_bytes_drop = 0;
+    _win_underflows = 0;
+}
+
 void Output::drain_to_i2s () {
     for (;;) {
         size_t item_size = 0;
@@ -57,7 +139,7 @@ void Output::drain_to_i2s () {
             kChunkBytes));
 
         if (item_size == 0) {
-            ESP_LOGI(TAG, "ring underflow -> prefetch");
+            note_underflow();
             _ring_mode = RingMode::Prefetching;
             return;
         }
@@ -88,7 +170,6 @@ void Output::write_task (void *arg) {
 
 esp_err_t Output::open () {
     if (_i2s_phase != I2sPhase::Closed) {
-        ESP_LOGW(TAG, "already open");
         return ESP_OK;
     }
 
@@ -105,7 +186,7 @@ esp_err_t Output::open () {
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(_tx_chan.get(), &std_cfg), TAG, "i2s_init_std");
 
     _i2s_phase = I2sPhase::Open;
-    ESP_LOGI(TAG, "I2S open BCK=%d LRCK=%d DOUT=%d", pins.bck, pins.lrck, pins.dout);
+    ESP_LOGI(TAG, "i2s open");
     return ESP_OK;
 }
 
@@ -118,6 +199,7 @@ void Output::close () {
     if (_i2s_phase == I2sPhase::Open) {
         _tx_chan.reset();
         _i2s_phase = I2sPhase::Closed;
+        ESP_LOGI(TAG, "i2s close");
     }
 }
 
@@ -161,12 +243,13 @@ esp_err_t Output::start () {
         return ESP_OK;
     }
     if (_i2s_phase != I2sPhase::Open) {
-        ESP_LOGE(TAG, "start: wrong phase %d", static_cast<int>(_i2s_phase));
+        ESP_LOGE(TAG, "start: phase=%s", phase_str(_i2s_phase));
         return ESP_ERR_INVALID_STATE;
     }
 
     ESP_RETURN_ON_ERROR(i2s_channel_enable(_tx_chan.get()), TAG, "i2s_enable");
     _ring_mode = RingMode::Prefetching;
+    reset_stream_stats();
 
     if (ensure_wake_sem() != ESP_OK || ensure_ring() != ESP_OK || ensure_writer_task() != ESP_OK) {
         disable_i2s();
@@ -174,6 +257,12 @@ esp_err_t Output::start () {
     }
 
     _i2s_phase = I2sPhase::Running;
+    ESP_LOGI(
+        TAG,
+        "i2s start expect=%" PRIu32 "B/s (%" PRIu32 "Hz ch=%d) vol=n/a",
+        expect_pcm_bps(),
+        _sample_rate_hz,
+        _channel_count);
     return ESP_OK;
 }
 
@@ -183,6 +272,10 @@ void Output::stop () {
     }
     disable_i2s();
     _i2s_phase = I2sPhase::Open;
+    ESP_LOGI(
+        TAG,
+        "i2s stop uf_total=%" PRIu32,
+        _total_underflows);
 }
 
 esp_err_t Output::configure_pcm (uint32_t sample_rate_hz, int channel_count) {
@@ -191,6 +284,9 @@ esp_err_t Output::configure_pcm (uint32_t sample_rate_hz, int channel_count) {
     }
 
     stop();
+
+    _sample_rate_hz = sample_rate_hz;
+    _channel_count = channel_count;
 
     const i2s_slot_mode_t slot =
         (channel_count == 1) ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO;
@@ -207,7 +303,6 @@ esp_err_t Output::configure_pcm (uint32_t sample_rate_hz, int channel_count) {
         TAG,
         "reconfig slot");
 
-    ESP_LOGI(TAG, "PCM %lu Hz, ch=%d", static_cast<unsigned long>(sample_rate_hz), channel_count);
     return ESP_OK;
 }
 
@@ -230,20 +325,26 @@ void Output::maybe_finish_prefetch () {
 
 size_t Output::write (const uint8_t *data, size_t size) {
     if (!_ringbuf || !data || size == 0) {
+        if (size > 0) {
+            note_write(size, 0);
+        }
         return 0;
     }
 
     if (_ring_mode == RingMode::Dropping) {
         on_drop_mode();
+        note_write(size, 0);
         return 0;
     }
 
     if (xRingbufferSend(_ringbuf.get(), data, size, 0) != pdTRUE) {
         _ring_mode = RingMode::Dropping;
+        note_write(size, 0);
         return 0;
     }
 
     maybe_finish_prefetch();
+    note_write(size, size);
     return size;
 }
 

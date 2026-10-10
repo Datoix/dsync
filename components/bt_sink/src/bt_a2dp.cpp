@@ -50,6 +50,22 @@ int sbc_channels (const esp_a2d_mcc_t &mcc) {
     return 2;
 }
 
+const char *sbc_ch_mode_str (uint8_t ch_mode) {
+    if (ch_mode & ESP_A2D_SBC_CIE_CH_MODE_MONO) {
+        return "mono";
+    }
+    if (ch_mode & ESP_A2D_SBC_CIE_CH_MODE_DUAL_CHANNEL) {
+        return "dual";
+    }
+    if (ch_mode & ESP_A2D_SBC_CIE_CH_MODE_STEREO) {
+        return "stereo";
+    }
+    if (ch_mode & ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO) {
+        return "joint";
+    }
+    return "?";
+}
+
 void gap_cb (esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
     if (!Sink::active()) {
         return;
@@ -58,21 +74,21 @@ void gap_cb (esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
     switch (event) {
     case ESP_BT_GAP_AUTH_CMPL_EVT:
         if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
-            ESP_LOGI(TAG, "auth ok: %s", param->auth_cmpl.device_name);
+            ESP_LOGI(TAG, "auth ok name=%s", param->auth_cmpl.device_name);
         } else {
-            ESP_LOGE(TAG, "auth fail: %d", param->auth_cmpl.stat);
+            ESP_LOGE(TAG, "auth fail stat=%d", param->auth_cmpl.stat);
         }
         return;
 #if CONFIG_DSYNC_BT_SSP_ENABLED
     case ESP_BT_GAP_CFM_REQ_EVT:
-        ESP_LOGI(TAG, "SSP confirm: %" PRIu32, param->cfm_req.num_val);
+        ESP_LOGI(TAG, "ssp confirm=%" PRIu32, param->cfm_req.num_val);
         esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
         return;
     case ESP_BT_GAP_KEY_NOTIF_EVT:
-        ESP_LOGI(TAG, "SSP passkey: %" PRIu32, param->key_notif.passkey);
+        ESP_LOGI(TAG, "ssp passkey=%" PRIu32, param->key_notif.passkey);
         return;
     case ESP_BT_GAP_KEY_REQ_EVT:
-        ESP_LOGI(TAG, "SSP passkey requested");
+        ESP_LOGW(TAG, "ssp passkey requested");
         return;
 #endif
     default:
@@ -108,7 +124,7 @@ void Sink::on_connection (void *param) {
     char bda_str[18] = {};
     ESP_LOGI(
         TAG,
-        "A2DP %s [%s]",
+        "a2dp %s peer=%s",
         conn_str[a2d->conn_stat.state],
         bda2str(a2d->conn_stat.remote_bda, bda_str, sizeof(bda_str)));
 
@@ -134,26 +150,50 @@ void Sink::on_connection (void *param) {
 
 void Sink::on_audio_state (void *param) {
     auto *a2d = static_cast<esp_a2d_cb_param_t *>(param);
-    static const char *audio_str[] = {"Suspended", "Started"};
-
-    ESP_LOGI(TAG, "A2DP audio %s", audio_str[a2d->audio_stat.state]);
 
     if (a2d->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
+        _audio.reset_stream_stats();
+        ESP_LOGI(
+            TAG,
+            "a2dp audio=Started expect_pcm=%" PRIu32 "B/s (%" PRIu32
+            "Hz ch=%d) vol=n/a (no AVRCP)",
+            _audio.expect_pcm_bps(),
+            _audio.sample_rate_hz(),
+            _audio.channel_count());
         _leds.set_status(dsync::ui::Status::Playing);
         return;
     }
+
+    ESP_LOGI(TAG, "a2dp audio=Suspended");
     _leds.set_status(dsync::ui::Status::Connected);
 }
 
 void Sink::on_audio_cfg (void *param) {
     auto *a2d = static_cast<esp_a2d_cb_param_t *>(param);
     if (a2d->audio_cfg.mcc.type != ESP_A2D_MCT_SBC) {
+        ESP_LOGW(TAG, "codec type=%d (not SBC) ignored", a2d->audio_cfg.mcc.type);
         return;
     }
 
+    const auto &sbc = a2d->audio_cfg.mcc.cie.sbc_info;
     const uint32_t rate = sbc_sample_rate(a2d->audio_cfg.mcc);
     const int ch = sbc_channels(a2d->audio_cfg.mcc);
-    // configure leaves Open; start is idempotent if CONNECTED already started.
+    const uint32_t expect_pcm = rate * static_cast<uint32_t>(ch) * 2u;
+
+    ESP_LOGI(
+        TAG,
+        "codec SBC rate=%" PRIu32 "Hz ch=%d (%s) bitpool=%u..%u "
+        "block=0x%x subbands=0x%x alloc=0x%x expect_pcm=%" PRIu32 "B/s vol=n/a",
+        rate,
+        ch,
+        sbc_ch_mode_str(sbc.ch_mode),
+        sbc.min_bitpool,
+        sbc.max_bitpool,
+        sbc.block_len,
+        sbc.num_subbands,
+        sbc.alloc_mthd,
+        expect_pcm);
+
     (void)_audio.configure_pcm(rate, ch);
     (void)_audio.start();
 }
@@ -175,7 +215,6 @@ void Sink::handle_a2d_event (uint16_t event, void *param) {
     case ESP_A2D_SNK_GET_DELAY_VALUE_EVT:
         return;
     default:
-        ESP_LOGD(TAG, "A2DP event %d", static_cast<int>(event));
         return;
     }
 }
@@ -189,7 +228,10 @@ void Sink::on_stack_up () {
     (void)esp_a2d_sink_get_delay_value();
     ESP_ERROR_CHECK(esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE));
     _leds.set_status(dsync::ui::Status::Discoverable);
-    ESP_LOGI(TAG, "discoverable as \"%s\"", CONFIG_DSYNC_BT_DEVICE_NAME);
+    ESP_LOGI(
+        TAG,
+        "ready name=%s avrcp=no vol=n/a",
+        CONFIG_DSYNC_BT_DEVICE_NAME);
 }
 
 }  // namespace dsync::bt
