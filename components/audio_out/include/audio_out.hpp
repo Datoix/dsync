@@ -17,6 +17,9 @@ namespace dsync::audio {
  *
  * PCM from A2DP is enqueued (non-blocking). A dedicated task ("i2s_wr")
  * drains the ringbuffer into I2S after a short prefetch.
+ *
+ * Lifecycle: Closed → open → Open → start → Running;
+ * configure_pcm leaves Open (caller start()s again).
  */
 struct Output {
     esp_err_t open ();
@@ -24,14 +27,15 @@ struct Output {
     esp_err_t start ();
     void stop ();
 
-    /** Match I2S clock/slots to the phone's SBC stream. */
+    /** Match I2S clock/slots to the SBC stream. Leaves Open; call start() after. */
     esp_err_t configure_pcm (uint32_t sample_rate_hz, int channel_count);
 
     /** Enqueue PCM (A2DP data callback). Returns bytes accepted. */
     size_t write (const uint8_t *data, size_t size);
 
 private:
-    enum class ChanState : uint8_t { Idle, Opened, Enabled };
+    /** I2S TX handle phase — not A2DP connection state. */
+    enum class I2sPhase : uint8_t { Closed, Open, Running };
 
     /** Prefetch until cushion, then Process; Drop if the ring is full. */
     enum class RingMode : uint8_t { Prefetching, Processing, Dropping };
@@ -55,7 +59,7 @@ private:
     handles::Sem _wake_sem;
     handles::Task _write_task;
 
-    ChanState _chan_st = ChanState::Idle;
+    I2sPhase _i2s_phase = I2sPhase::Closed;
     RingMode _ring_mode = RingMode::Prefetching;
 };
 

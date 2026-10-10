@@ -62,7 +62,7 @@ void Output::drain_to_i2s () {
             return;
         }
 
-        if (_chan_st == ChanState::Enabled) {
+        if (_i2s_phase == I2sPhase::Running) {
             size_t written = 0;
             (void)i2s_channel_write(
                 _tx_chan.get(),
@@ -87,7 +87,7 @@ void Output::write_task (void *arg) {
 }
 
 esp_err_t Output::open () {
-    if (_chan_st != ChanState::Idle) {
+    if (_i2s_phase != I2sPhase::Closed) {
         ESP_LOGW(TAG, "already open");
         return ESP_OK;
     }
@@ -104,7 +104,7 @@ esp_err_t Output::open () {
     _tx_chan.reset(raw);
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(_tx_chan.get(), &std_cfg), TAG, "i2s_init_std");
 
-    _chan_st = ChanState::Opened;
+    _i2s_phase = I2sPhase::Open;
     ESP_LOGI(TAG, "I2S open BCK=%d LRCK=%d DOUT=%d", pins.bck, pins.lrck, pins.dout);
     return ESP_OK;
 }
@@ -115,9 +115,9 @@ void Output::close () {
     _ringbuf.reset();
     _wake_sem.reset();
 
-    if (_chan_st == ChanState::Opened) {
+    if (_i2s_phase == I2sPhase::Open) {
         _tx_chan.reset();
-        _chan_st = ChanState::Idle;
+        _i2s_phase = I2sPhase::Closed;
     }
 }
 
@@ -157,8 +157,11 @@ esp_err_t Output::ensure_writer_task () {
 }
 
 esp_err_t Output::start () {
-    if (_chan_st != ChanState::Opened) {
-        ESP_LOGE(TAG, "start: wrong state %d", static_cast<int>(_chan_st));
+    if (_i2s_phase == I2sPhase::Running) {
+        return ESP_OK;
+    }
+    if (_i2s_phase != I2sPhase::Open) {
+        ESP_LOGE(TAG, "start: wrong phase %d", static_cast<int>(_i2s_phase));
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -170,16 +173,16 @@ esp_err_t Output::start () {
         return ESP_ERR_NO_MEM;
     }
 
-    _chan_st = ChanState::Enabled;
+    _i2s_phase = I2sPhase::Running;
     return ESP_OK;
 }
 
 void Output::stop () {
-    if (_chan_st != ChanState::Enabled || !_tx_chan) {
+    if (_i2s_phase != I2sPhase::Running || !_tx_chan) {
         return;
     }
     disable_i2s();
-    _chan_st = ChanState::Opened;
+    _i2s_phase = I2sPhase::Open;
 }
 
 esp_err_t Output::configure_pcm (uint32_t sample_rate_hz, int channel_count) {

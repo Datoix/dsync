@@ -153,6 +153,7 @@ void Sink::on_audio_cfg (void *param) {
 
     const uint32_t rate = sbc_sample_rate(a2d->audio_cfg.mcc);
     const int ch = sbc_channels(a2d->audio_cfg.mcc);
+    // configure leaves Open; start is idempotent if CONNECTED already started.
     (void)_audio.configure_pcm(rate, ch);
     (void)_audio.start();
 }
