@@ -12,8 +12,8 @@ extern "C" void app_main (void) {
 
     // Process-lifetime owners; Sink only holds references.
     static dsync::ui::Leds leds;
-    static dsync::audio::Output audio;
-    static dsync::bt::Sink sink(audio, leds);
+    static dsync::audio::Dac dac;
+    static dsync::bt::Sink sink(dac, leds);
 
     ESP_ERROR_CHECK(leds.init());
     ESP_ERROR_CHECK(sink.start());

@@ -6,15 +6,7 @@ menu "dsync audio"
         range 4 128
         help
             Ring between the A2DP data callback (producer) and the I2S writer
-            task (consumer). Bigger absorbs longer network stalls.
-
-    config DSYNC_AUDIO_PREFETCH_KB
-        int "Playback cushion before the writer starts (KiB)"
-        default 8
-        range 2 64
-        help
-            The writer holds off until this much PCM is buffered, which hides
-            Bluetooth jitter. Larger = fewer underruns but slower start-up.
-            Must stay below DSYNC_AUDIO_RING_KB.
+            task (consumer). Bigger absorbs longer network stalls; the frame is
+            dropped if it overflows.
 
 endmenu

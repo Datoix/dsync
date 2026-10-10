@@ -36,22 +36,6 @@ int sbc_channels (const esp_a2d_mcc_t &mcc) {
     return 2;
 }
 
-const char *sbc_ch_mode_str (uint8_t ch_mode) {
-    if (ch_mode & ESP_A2D_SBC_CIE_CH_MODE_MONO) {
-        return "mono";
-    }
-    if (ch_mode & ESP_A2D_SBC_CIE_CH_MODE_DUAL_CHANNEL) {
-        return "dual";
-    }
-    if (ch_mode & ESP_A2D_SBC_CIE_CH_MODE_STEREO) {
-        return "stereo";
-    }
-    if (ch_mode & ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO) {
-        return "joint";
-    }
-    return "?";
-}
-
 void gap_cb (esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
     if (!Sink::active()) {
         return;
@@ -98,7 +82,7 @@ void a2d_data_cb (const uint8_t *data, uint32_t len) {
     if (!self) {
         return;
     }
-    (void)self->audio().write(data, len);
+    (void)self->dac().push(data, len);
 }
 
 }  // namespace
@@ -116,19 +100,18 @@ void Sink::on_connection (void *param) {
 
     if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
         esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-        _audio.stop();  // drop queued audio; the I2S channel is process-lifetime
+        _dac.stop();
         _leds.set_status(dsync::ui::Status::Discoverable);
         return;
     }
 
     if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTING) {
-        (void)_audio.open();
+        (void)_dac.open();
         return;
     }
 
     if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
         esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
-        (void)_audio.start();
         _leds.set_status(dsync::ui::Status::Connected);
     }
 }
@@ -137,20 +120,18 @@ void Sink::on_audio_state (void *param) {
     auto *a2d = static_cast<esp_a2d_cb_param_t *>(param);
 
     if (a2d->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
-        _audio.reset_stream_stats();
-        ESP_LOGI(
-            TAG,
-            "a2dp audio=Started expect_pcm=%" PRIu32 "B/s (%" PRIu32
-            "Hz ch=%d) vol=n/a (no AVRCP)",
-            _audio.expect_pcm_bps(),
-            _audio.sample_rate_hz(),
-            _audio.channel_count());
+        const esp_err_t err = _dac.start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "start failed: %s", esp_err_to_name(err));
+        }
         _leds.set_status(dsync::ui::Status::Playing);
+        ESP_LOGI(TAG, "a2dp audio=Started");
         return;
     }
 
-    ESP_LOGI(TAG, "a2dp audio=Suspended");
+    _dac.stop();
     _leds.set_status(dsync::ui::Status::Connected);
+    ESP_LOGI(TAG, "a2dp audio=Suspended");
 }
 
 void Sink::on_audio_cfg (void *param) {
@@ -163,36 +144,19 @@ void Sink::on_audio_cfg (void *param) {
     const auto &sbc = a2d->audio_cfg.mcc.cie.sbc_info;
     const uint32_t rate = sbc_sample_rate(a2d->audio_cfg.mcc);
     const int ch = sbc_channels(a2d->audio_cfg.mcc);
-    const uint32_t expect_pcm = rate * static_cast<uint32_t>(ch) * 2u;
 
     ESP_LOGI(
         TAG,
-        "codec SBC rate=%" PRIu32 "Hz ch=%d (%s) bitpool=%u..%u "
-        "block=0x%x subbands=0x%x alloc=0x%x expect_pcm=%" PRIu32 "B/s vol=n/a",
+        "codec SBC rate=%" PRIu32 "Hz ch=%d bitpool=%u..%u expect=%" PRIu32 "B/s",
         rate,
         ch,
-        sbc_ch_mode_str(sbc.ch_mode),
         sbc.min_bitpool,
         sbc.max_bitpool,
-        sbc.block_len,
-        sbc.num_subbands,
-        sbc.alloc_mthd,
-        expect_pcm);
+        rate * static_cast<uint32_t>(ch) * 2u);
 
-    const esp_err_t cfg_err = _audio.configure_pcm(rate, ch);
-    if (cfg_err != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "configure_pcm(%" PRIu32 "Hz,%d) failed: %s",
-            rate,
-            ch,
-            esp_err_to_name(cfg_err));
-        return;  // keep I2S disabled rather than start with a stale format
-    }
-
-    const esp_err_t start_err = _audio.start();
-    if (start_err != ESP_OK) {
-        ESP_LOGE(TAG, "audio start failed: %s", esp_err_to_name(start_err));
+    const esp_err_t err = _dac.set_format(rate, ch);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "set_format(%" PRIu32 "Hz,%d) failed: %s", rate, ch, esp_err_to_name(err));
     }
 }
 

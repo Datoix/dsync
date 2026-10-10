@@ -17,8 +17,8 @@ namespace dsync::bt {
  * C stack callbacks reach this instance via active() (process-lifetime trampoline).
  */
 struct Sink {
-    Sink (dsync::audio::Output &audio, dsync::ui::Leds &leds)
-        : _audio(audio)
+    Sink (dsync::audio::Dac &dac, dsync::ui::Leds &leds)
+        : _dac(dac)
         , _leds(leds) {}
 
     ~Sink ();
@@ -34,8 +34,8 @@ struct Sink {
         return _active;
     }
 
-    dsync::audio::Output &audio () {
-        return _audio;
+    dsync::audio::Dac &dac () {
+        return _dac;
     }
 
     dsync::ui::Leds &leds () {
@@ -68,7 +68,7 @@ private:
     esp_err_t start_worker ();
     esp_err_t post_stack_up ();
 
-    dsync::audio::Output &_audio;
+    dsync::audio::Dac &_dac;
     dsync::ui::Leds &_leds;
     handles::Queue _work_q;
     handles::Task _work_task;

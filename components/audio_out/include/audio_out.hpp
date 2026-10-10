@@ -17,103 +17,57 @@ namespace dsync::audio {
  * I2S TX → PCM5102A, fed from the A2DP data callback through a ring buffer.
  * Owned by app_main; bt_sink holds a non-owning reference.
  *
- * Threading model
- * ---------------
- *   A2DP data callback task → write()         : enqueue only (never blocks, never logs)
- *   "i2s_wr" task           → drain_to_i2s()  : pops the ring, writes I2S, emits stats
- *   "bt_work" task          → open/start/stop/configure_pcm : owns the stream state
+ * Three tasks touch this object:
+ *   A2DP data callback → push()        : enqueue only; never blocks, never logs
+ *   "i2s_wr"           → writer_task() : drains the ring into I2S, logs stats
+ *   "bt_work"          → open/start/stop/set_format
  *
- * All shared scalars are std::atomic so no task can observe a torn value; the
- * ring buffer carries its own locking. The I2S channel, ring, semaphore and
- * writer task are created once in open() and live for the process lifetime, so
- * teardown can never free memory the data callback or writer task still touches.
+ * Lifecycle:
+ *   open()       allocate the channel + ring + writer task (idempotent)
+ *   set_format() pick the I2S clock/slots, keeping the running state as it was
+ *   start()      enable I2S and accept PCM      stop()  disable I2S, drop the ring
  *
- * Stream states
- * -------------
- *   Idle    → nothing allocated yet (only before the first connection)
- *   Ready   → channel allocated and disabled; the PCM format may be reconfigured
- *   Running → channel enabled; write() accepts PCM
- *
- * Ring modes (how the ring is driven)
- * -----------------------------------
- *   Prefetching → fill to the cushion before the writer starts (absorbs jitter)
- *   Processing  → writer drains normally
- *   Dropping    → ring full; drop incoming PCM until the writer catches up
+ * Only two fields are shared between tasks, both atomic: `_running` (bt_work ↔
+ * data callback) and `_bytes_dropped` (data callback ↔ writer). Everything else
+ * is owned by a single task. The channel/ring/writer are allocated once and live
+ * for the process, so nothing is ever freed under a running callback.
  */
-struct Output {
-    /** Allocate I2S + ring + writer task (idempotent). Leaves state Ready. */
+struct Dac {
     esp_err_t open ();
-
-    /** Enable I2S and start accepting PCM. Leaves state Running. */
     esp_err_t start ();
-
-    /** Stop accepting PCM, disable I2S and drop queued audio. Leaves state Ready. */
     void stop ();
 
-    /** Match the I2S clock/slots to the negotiated SBC stream. Leaves state Ready. */
-    esp_err_t configure_pcm (uint32_t sample_rate_hz, int channel_count);
+    /** Match the I2S clock/slots to the negotiated stream; keeps running state. */
+    esp_err_t set_format (uint32_t sample_rate_hz, int channels);
 
     /** Enqueue PCM from the A2DP data callback. Returns bytes accepted. */
-    size_t write (const uint8_t *data, size_t size);
-
-    uint32_t sample_rate_hz () const {
-        return _sample_rate_hz.load(std::memory_order_relaxed);
-    }
-
-    int channel_count () const {
-        return _channel_count.load(std::memory_order_relaxed);
-    }
-
-    /** Expected PCM byte rate for the current format (16-bit samples). */
-    uint32_t expect_pcm_bps () const {
-        return sample_rate_hz() * static_cast<uint32_t>(channel_count()) * 2u;
-    }
-
-    /** Zero the throughput counters (call when A2DP audio starts/stops). */
-    void reset_stream_stats ();
+    size_t push (const uint8_t *data, size_t size);
 
 private:
-    enum class I2sPhase : uint8_t { Idle, Ready, Running };
-    enum class RingMode : uint8_t { Prefetching, Processing, Dropping };
+    static void writer_task (void *arg);
 
-    static void write_task (void *arg);
+    void drain ();
+    void drop_ring ();
+    void log_stats ();
 
-    void drain_to_i2s ();
-    void clear_ring ();
-    void disable_i2s ();
-    size_t ring_bytes_used () const;
-    void maybe_log_stream ();
+    bool is_running () const {
+        return _running.load(std::memory_order_acquire);
+    }
 
-    esp_err_t ensure_wake_sem ();
-    esp_err_t ensure_ring ();
-    esp_err_t ensure_writer_task ();
+    handles::I2sChan _chan;
+    handles::Ringbuf _ring;
+    handles::Task _writer;
 
-    static i2s_std_config_t make_std_config (const dsync::board::DacPins &pins);
-    static const char *phase_str (I2sPhase p);
-    static const char *ring_str (RingMode m);
+    /** Set by bt_work, read by the data callback. */
+    std::atomic<bool> _running {false};
 
-    // Process-lifetime resources (see the threading note above).
-    handles::I2sChan _tx_chan;
-    handles::Ringbuf _ringbuf;
-    handles::Sem _wake_sem;
-    handles::Task _write_task;
+    /** Written by the data callback, consumed by the writer. */
+    std::atomic<uint32_t> _bytes_dropped {0};
 
-    std::atomic<I2sPhase> _i2s_phase {I2sPhase::Idle};
-    std::atomic<RingMode> _ring_mode {RingMode::Prefetching};
-    /** True only between start() and stop(); gates write() against teardown. */
-    std::atomic<bool> _accepting {false};
-
-    std::atomic<uint32_t> _sample_rate_hz {44100};
-    std::atomic<int> _channel_count {2};
-
-    /** Throughput counters: written by the producer, consumed by the writer task. */
-    std::atomic<uint32_t> _win_bytes_in {0};
-    std::atomic<uint32_t> _win_bytes_drop {0};
-    std::atomic<uint32_t> _win_underflows {0};
-    std::atomic<uint32_t> _total_underflows {0};
-
-    /** Log-window clock; owned exclusively by the writer task. */
-    TickType_t _stats_tick {};
+    /** Writer-owned statistics. */
+    uint32_t _bytes_written = 0;
+    uint32_t _underflows = 0;
+    TickType_t _last_log {};
 };
 
 }  // namespace dsync::audio

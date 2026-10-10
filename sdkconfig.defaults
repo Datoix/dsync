@@ -25,6 +25,5 @@ CONFIG_DSYNC_PCM5102_FLT_GPIO=4
 CONFIG_DSYNC_LED_GPIO=2
 CONFIG_DSYNC_LED_ACTIVE_LEVEL=1
 
-# audio_out ring / startup cushion (Kconfig in components/audio_out/Kconfig.projbuild)
+# audio_out ring (Kconfig in components/audio_out/Kconfig.projbuild)
 CONFIG_DSYNC_AUDIO_RING_KB=32
-CONFIG_DSYNC_AUDIO_PREFETCH_KB=8
