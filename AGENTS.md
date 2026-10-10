@@ -17,7 +17,7 @@ docs/                 ARCHITECTURE, HARDWARE, ROADMAP, VERSIONS
 ```
 
 Namespaces: `dsync::board`, `dsync::handles`, `dsync::audio`, `dsync::bt`, `dsync::ui`.
-`app_main` owns `Leds`, `Output`, `Sink`. `Sink` takes non-owning refs to audio/UI.
+`app_main` owns `Leds`, `Dac`, `Sink`. `Sink` takes non-owning refs to audio/UI.
 
 ## Build & flash
 
@@ -29,6 +29,8 @@ idf.py -p /dev/ttyUSB0 flash monitor   # Ctrl+] to quit
 ```
 
 Menuconfig: *dsync board* (GPIOs) and *dsync Bluetooth* (device name, SSP).
+
+These commands are run by the **user**, not the agent — see the guardrails below.
 
 ## Guardrails
 
@@ -42,8 +44,11 @@ Menuconfig: *dsync board* (GPIOs) and *dsync Bluetooth* (device name, SSP).
 - **Ask before packages / sudo.** Do not run without explicit user OK: `sudo`, system
   package managers, or installs that change the env/lockfiles (`pip` / `uv` / `npm` /
   `idf.py add-dependency` / `cargo install`, …) — unless the user already asked for that
-  exact action. Stop and ask instead. Building with an already-configured ESP-IDF
-  (`idf.py build` / `flash`) is fine without asking.
+  exact action. Stop and ask instead.
+- **Never build, flash, or monitor — hand off instead.** Do not run `idf.py build`,
+  `idf.py flash`, `idf.py monitor`, `idf.py reconfigure`, or any other compile/run step,
+  not even to validate a change. When an edit is finished, stop and tell the user exactly
+  what to build/flash and what to look for in the output.
 
 ## C++ / ESP-IDF conventions
 
