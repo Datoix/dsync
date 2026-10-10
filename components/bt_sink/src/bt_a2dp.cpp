@@ -1,8 +1,8 @@
 #include "bt_sink.hpp"
 
 #include <cinttypes>
-#include <cstdio>
 
+#include "bt_bda.hpp"
 #include "esp_a2dp_api.h"
 #include "esp_gap_bt_api.h"
 #include "esp_log.h"
@@ -13,22 +13,8 @@ namespace {
 
 constexpr char TAG[] = "bt_a2dp";
 
-char *bda2str (const uint8_t *bda, char *str, size_t size) {
-    if (!bda || !str || size < 18) {
-        return nullptr;
-    }
-    std::snprintf(
-        str,
-        size,
-        "%02x:%02x:%02x:%02x:%02x:%02x",
-        bda[0],
-        bda[1],
-        bda[2],
-        bda[3],
-        bda[4],
-        bda[5]);
-    return str;
-}
+/** Reported A2DP render delay (1/10 ms units) added to the stack default. */
+constexpr uint32_t kAppDelayTenthMs = 50;
 
 uint32_t sbc_sample_rate (const esp_a2d_mcc_t &mcc) {
     if (mcc.cie.sbc_info.samp_freq & ESP_A2D_SBC_CIE_SF_48K) {
@@ -130,8 +116,7 @@ void Sink::on_connection (void *param) {
 
     if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
         esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-        _audio.stop();
-        _audio.close();
+        _audio.stop();  // drop queued audio; the I2S channel is process-lifetime
         _leds.set_status(dsync::ui::Status::Discoverable);
         return;
     }
@@ -194,8 +179,21 @@ void Sink::on_audio_cfg (void *param) {
         sbc.alloc_mthd,
         expect_pcm);
 
-    (void)_audio.configure_pcm(rate, ch);
-    (void)_audio.start();
+    const esp_err_t cfg_err = _audio.configure_pcm(rate, ch);
+    if (cfg_err != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "configure_pcm(%" PRIu32 "Hz,%d) failed: %s",
+            rate,
+            ch,
+            esp_err_to_name(cfg_err));
+        return;  // keep I2S disabled rather than start with a stale format
+    }
+
+    const esp_err_t start_err = _audio.start();
+    if (start_err != ESP_OK) {
+        ESP_LOGE(TAG, "audio start failed: %s", esp_err_to_name(start_err));
+    }
 }
 
 void Sink::handle_a2d_event (uint16_t event, void *param) {
@@ -209,10 +207,19 @@ void Sink::handle_a2d_event (uint16_t event, void *param) {
     case ESP_A2D_AUDIO_CFG_EVT:
         on_audio_cfg(param);
         return;
+    case ESP_A2D_SNK_GET_DELAY_VALUE_EVT: {
+        // Reply with the stack default plus our own buffering latency, as the
+        // IDF 6.1 reference sink does. Sources that honour delay reporting pace
+        // the stream more evenly.
+        auto *a2d = static_cast<esp_a2d_cb_param_t *>(param);
+        const uint32_t delay = a2d->a2d_get_delay_value_stat.delay_value + kAppDelayTenthMs;
+        (void)esp_a2d_sink_set_delay_value(delay);
+        ESP_LOGI(TAG, "delay report %" PRIu32 " *0.1ms", delay);
+        return;
+    }
     case ESP_A2D_PROF_STATE_EVT:
     case ESP_A2D_SNK_PSC_CFG_EVT:
     case ESP_A2D_SNK_SET_DELAY_VALUE_EVT:
-    case ESP_A2D_SNK_GET_DELAY_VALUE_EVT:
         return;
     default:
         return;

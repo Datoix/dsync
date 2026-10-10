@@ -4,25 +4,34 @@
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "sdkconfig.h"
 
 namespace dsync::audio {
 namespace {
 
 constexpr char TAG[] = "audio_out";
 
-constexpr size_t kRingBytes = 32 * 1024;
-constexpr size_t kPrefetchBytes = 20 * 1024;
+/** Ring capacity and start-playback cushion (Kconfig in Kconfig.projbuild). */
+constexpr size_t kRingBytes = static_cast<size_t>(CONFIG_DSYNC_AUDIO_RING_KB) * 1024u;
+constexpr size_t kPrefetchBytes = static_cast<size_t>(CONFIG_DSYNC_AUDIO_PREFETCH_KB) * 1024u;
+
+/** Bytes per I2S write (matches the IDF reference: one DMA descriptor burst). */
 constexpr size_t kChunkBytes = 240 * 6;
-constexpr TickType_t kStatsPeriodTicks = pdMS_TO_TICKS(1000);
+
+/** How long the writer waits for more PCM before declaring an underflow. */
+constexpr TickType_t kRingRxTimeout = pdMS_TO_TICKS(20);
+
+/** Stats are emitted at most once per second, and only by the writer task. */
+constexpr TickType_t kStatsPeriod = pdMS_TO_TICKS(1000);
 
 }  // namespace
 
 const char *Output::phase_str (I2sPhase p) {
     switch (p) {
-    case I2sPhase::Closed:
-        return "closed";
-    case I2sPhase::Open:
-        return "open";
+    case I2sPhase::Idle:
+        return "idle";
+    case I2sPhase::Ready:
+        return "ready";
     case I2sPhase::Running:
         return "running";
     }
@@ -74,84 +83,45 @@ size_t Output::ring_bytes_used () const {
     return used;
 }
 
+/** Drop everything queued so a reconnect (or a new format) starts clean. */
+void Output::clear_ring () {
+    if (!_ringbuf) {
+        return;
+    }
+    for (;;) {
+        size_t size = 0;
+        void *item = xRingbufferReceiveUpTo(_ringbuf.get(), &size, 0, kRingBytes);
+        if (item == nullptr || size == 0) {
+            return;
+        }
+        vRingbufferReturnItem(_ringbuf.get(), item);
+    }
+}
+
 void Output::reset_stream_stats () {
-    _stats_tick = xTaskGetTickCount();
-    _win_bytes_in = 0;
-    _win_bytes_drop = 0;
-    _win_underflows = 0;
-}
-
-void Output::note_write (size_t offered, size_t accepted) {
-    if (accepted < offered) {
-        _win_bytes_drop += static_cast<uint32_t>(offered - accepted);
-    }
-    _win_bytes_in += static_cast<uint32_t>(accepted);
-    maybe_log_stream();
-}
-
-void Output::note_underflow () {
-    ++_win_underflows;
-    ++_total_underflows;
-}
-
-void Output::maybe_log_stream () {
-    const TickType_t now = xTaskGetTickCount();
-    if (_stats_tick == 0) {
-        _stats_tick = now;
-        return;
-    }
-    if ((now - _stats_tick) < kStatsPeriodTicks) {
-        return;
-    }
-
-    const uint32_t expect = expect_pcm_bps();
-    const uint32_t ring = static_cast<uint32_t>(ring_bytes_used());
-    ESP_LOGI(
-        TAG,
-        "stream in=%" PRIu32 "B/s drop=%" PRIu32 "B/s expect=%" PRIu32
-        "B/s (%" PRIu32 "Hz ch=%d) ring=%" PRIu32 "/%u uf=%" PRIu32
-        "/%" PRIu32 " i2s=%s ring_mode=%s vol=n/a",
-        _win_bytes_in,
-        _win_bytes_drop,
-        expect,
-        _sample_rate_hz,
-        _channel_count,
-        ring,
-        static_cast<unsigned>(kRingBytes),
-        _win_underflows,
-        _total_underflows,
-        phase_str(_i2s_phase),
-        ring_str(_ring_mode));
-
-    _stats_tick = now;
-    _win_bytes_in = 0;
-    _win_bytes_drop = 0;
-    _win_underflows = 0;
+    _win_bytes_in.store(0, std::memory_order_relaxed);
+    _win_bytes_drop.store(0, std::memory_order_relaxed);
+    _win_underflows.store(0, std::memory_order_relaxed);
+    // _stats_tick belongs to the writer task; leave it alone here.
 }
 
 void Output::drain_to_i2s () {
     for (;;) {
-        size_t item_size = 0;
-        auto *data = static_cast<uint8_t *>(xRingbufferReceiveUpTo(
-            _ringbuf.get(),
-            &item_size,
-            pdMS_TO_TICKS(20),
-            kChunkBytes));
+        size_t size = 0;
+        void *data = xRingbufferReceiveUpTo(_ringbuf.get(), &size, kRingRxTimeout, kChunkBytes);
 
-        if (item_size == 0) {
-            note_underflow();
-            _ring_mode = RingMode::Prefetching;
+        if (size == 0) {
+            // Producer too slow → underrun. Rebuild the cushion before playing again.
+            _win_underflows.fetch_add(1, std::memory_order_relaxed);
+            _total_underflows.fetch_add(1, std::memory_order_relaxed);
+            _ring_mode.store(RingMode::Prefetching, std::memory_order_relaxed);
             return;
         }
 
-        if (_i2s_phase == I2sPhase::Running) {
+        // stop() may disable the channel mid-drain; skip the write in that case.
+        if (_i2s_phase.load(std::memory_order_relaxed) == I2sPhase::Running) {
             size_t written = 0;
-            (void)i2s_channel_write(
-                _tx_chan.get(),
-                data,
-                item_size,
-                &written,
-                portMAX_DELAY);
+            (void)i2s_channel_write(_tx_chan.get(), data, size, &written, portMAX_DELAY);
         }
         vRingbufferReturnItem(_ringbuf.get(), data);
     }
@@ -161,46 +131,51 @@ void Output::write_task (void *arg) {
     auto *self = static_cast<Output *>(arg);
 
     for (;;) {
-        if (xSemaphoreTake(self->_wake_sem.get(), portMAX_DELAY) != pdTRUE) {
-            continue;
+        // Wake on new PCM, or every kStatsPeriod so stats are emitted from THIS
+        // task and never from the A2DP data callback.
+        if (xSemaphoreTake(self->_wake_sem.get(), kStatsPeriod) == pdTRUE) {
+            self->drain_to_i2s();
         }
-        self->drain_to_i2s();
+        self->maybe_log_stream();
     }
 }
 
-esp_err_t Output::open () {
-    if (_i2s_phase != I2sPhase::Closed) {
-        return ESP_OK;
+/** Emit one throughput line per second while the pipeline is active. */
+void Output::maybe_log_stream () {
+    const TickType_t now = xTaskGetTickCount();
+    if (_stats_tick == 0) {
+        _stats_tick = now;
+        return;
+    }
+    if ((now - _stats_tick) < kStatsPeriod) {
+        return;
     }
 
-    const auto &pins = dsync::board::kPins.dac;
-    ESP_RETURN_ON_ERROR(pins.apply_mode(), TAG, "dac_mode");
+    const uint32_t in = _win_bytes_in.exchange(0, std::memory_order_relaxed);
+    const uint32_t drop = _win_bytes_drop.exchange(0, std::memory_order_relaxed);
+    const uint32_t uf = _win_underflows.exchange(0, std::memory_order_relaxed);
+    _stats_tick = now;
 
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.auto_clear = true;
-    const i2s_std_config_t std_cfg = make_std_config(pins);
-
-    i2s_chan_handle_t raw = nullptr;
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &raw, nullptr), TAG, "i2s_new_channel");
-    _tx_chan.reset(raw);
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(_tx_chan.get(), &std_cfg), TAG, "i2s_init_std");
-
-    _i2s_phase = I2sPhase::Open;
-    ESP_LOGI(TAG, "i2s open");
-    return ESP_OK;
-}
-
-void Output::close () {
-    stop();
-    _write_task.reset();
-    _ringbuf.reset();
-    _wake_sem.reset();
-
-    if (_i2s_phase == I2sPhase::Open) {
-        _tx_chan.reset();
-        _i2s_phase = I2sPhase::Closed;
-        ESP_LOGI(TAG, "i2s close");
+    if (in == 0 && drop == 0 && uf == 0) {
+        return;  // idle: don't spam when nothing is streaming
     }
+
+    ESP_LOGI(
+        TAG,
+        "stream in=%" PRIu32 "B/s drop=%" PRIu32 "B/s expect=%" PRIu32
+        "B/s (%" PRIu32 "Hz ch=%d) ring=%u/%u uf=%" PRIu32 "/%" PRIu32
+        " i2s=%s ring_mode=%s",
+        in,
+        drop,
+        expect_pcm_bps(),
+        sample_rate_hz(),
+        channel_count(),
+        static_cast<unsigned>(ring_bytes_used()),
+        static_cast<unsigned>(kRingBytes),
+        uf,
+        _total_underflows.load(std::memory_order_relaxed),
+        phase_str(_i2s_phase.load(std::memory_order_relaxed)),
+        ring_str(_ring_mode.load(std::memory_order_relaxed)));
 }
 
 esp_err_t Output::ensure_wake_sem () {
@@ -238,55 +213,89 @@ esp_err_t Output::ensure_writer_task () {
     return ESP_OK;
 }
 
+esp_err_t Output::open () {
+    if (_i2s_phase.load(std::memory_order_relaxed) != I2sPhase::Idle) {
+        return ESP_OK;  // already allocated; the channel is process-lifetime
+    }
+
+    const auto &pins = dsync::board::kPins.dac;
+    ESP_RETURN_ON_ERROR(pins.apply_mode(), TAG, "dac_mode");
+
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    const i2s_std_config_t std_cfg = make_std_config(pins);
+
+    i2s_chan_handle_t raw = nullptr;
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &raw, nullptr), TAG, "i2s_new_channel");
+    _tx_chan.reset(raw);
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(_tx_chan.get(), &std_cfg), TAG, "i2s_init_std");
+
+    ESP_RETURN_ON_ERROR(ensure_wake_sem(), TAG, "wake_sem");
+    ESP_RETURN_ON_ERROR(ensure_ring(), TAG, "ring");
+    ESP_RETURN_ON_ERROR(ensure_writer_task(), TAG, "writer_task");
+
+    _i2s_phase.store(I2sPhase::Ready, std::memory_order_relaxed);
+    ESP_LOGI(
+        TAG,
+        "i2s open ring=%uB prefetch=%uB",
+        static_cast<unsigned>(kRingBytes),
+        static_cast<unsigned>(kPrefetchBytes));
+    return ESP_OK;
+}
+
 esp_err_t Output::start () {
-    if (_i2s_phase == I2sPhase::Running) {
+    const I2sPhase phase = _i2s_phase.load(std::memory_order_relaxed);
+    if (phase == I2sPhase::Running) {
         return ESP_OK;
     }
-    if (_i2s_phase != I2sPhase::Open) {
-        ESP_LOGE(TAG, "start: phase=%s", phase_str(_i2s_phase));
+    if (phase != I2sPhase::Ready) {
+        ESP_LOGE(TAG, "start: state=%s (open() first)", phase_str(phase));
         return ESP_ERR_INVALID_STATE;
     }
 
+    clear_ring();
     ESP_RETURN_ON_ERROR(i2s_channel_enable(_tx_chan.get()), TAG, "i2s_enable");
-    _ring_mode = RingMode::Prefetching;
+
+    _ring_mode.store(RingMode::Prefetching, std::memory_order_relaxed);
     reset_stream_stats();
+    _i2s_phase.store(I2sPhase::Running, std::memory_order_relaxed);
+    _accepting.store(true, std::memory_order_release);
 
-    if (ensure_wake_sem() != ESP_OK || ensure_ring() != ESP_OK || ensure_writer_task() != ESP_OK) {
-        disable_i2s();
-        return ESP_ERR_NO_MEM;
-    }
-
-    _i2s_phase = I2sPhase::Running;
     ESP_LOGI(
         TAG,
-        "i2s start expect=%" PRIu32 "B/s (%" PRIu32 "Hz ch=%d) vol=n/a",
+        "i2s start expect=%" PRIu32 "B/s (%" PRIu32 "Hz ch=%d)",
         expect_pcm_bps(),
-        _sample_rate_hz,
-        _channel_count);
+        sample_rate_hz(),
+        channel_count());
     return ESP_OK;
 }
 
 void Output::stop () {
-    if (_i2s_phase != I2sPhase::Running || !_tx_chan) {
+    if (_i2s_phase.load(std::memory_order_relaxed) != I2sPhase::Running) {
         return;
     }
+
+    // Stop accepting first so the data callback can't enqueue into a ring we clear.
+    _accepting.store(false, std::memory_order_release);
     disable_i2s();
-    _i2s_phase = I2sPhase::Open;
-    ESP_LOGI(
-        TAG,
-        "i2s stop uf_total=%" PRIu32,
-        _total_underflows);
+    clear_ring();
+    _i2s_phase.store(I2sPhase::Ready, std::memory_order_relaxed);
+
+    ESP_LOGI(TAG, "i2s stop uf_total=%" PRIu32, _total_underflows.load(std::memory_order_relaxed));
 }
 
 esp_err_t Output::configure_pcm (uint32_t sample_rate_hz, int channel_count) {
     if (!_tx_chan) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (channel_count < 1 || channel_count > 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
-    stop();
+    stop();  // must be disabled to reconfigure; leaves Ready
 
-    _sample_rate_hz = sample_rate_hz;
-    _channel_count = channel_count;
+    _sample_rate_hz.store(sample_rate_hz, std::memory_order_relaxed);
+    _channel_count.store(channel_count, std::memory_order_relaxed);
 
     const i2s_slot_mode_t slot =
         (channel_count == 1) ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO;
@@ -303,48 +312,49 @@ esp_err_t Output::configure_pcm (uint32_t sample_rate_hz, int channel_count) {
         TAG,
         "reconfig slot");
 
+    ESP_LOGI(
+        TAG,
+        "pcm %" PRIu32 "Hz ch=%d expect=%" PRIu32 "B/s",
+        sample_rate_hz,
+        channel_count,
+        expect_pcm_bps());
     return ESP_OK;
 }
 
-void Output::on_drop_mode () {
-    if (ring_bytes_used() <= kPrefetchBytes) {
-        _ring_mode = RingMode::Processing;
-    }
-}
-
-void Output::maybe_finish_prefetch () {
-    if (_ring_mode != RingMode::Prefetching) {
-        return;
-    }
-    if (ring_bytes_used() < kPrefetchBytes) {
-        return;
-    }
-    _ring_mode = RingMode::Processing;
-    (void)xSemaphoreGive(_wake_sem.get());
-}
-
 size_t Output::write (const uint8_t *data, size_t size) {
-    if (!_ringbuf || !data || size == 0) {
-        if (size > 0) {
-            note_write(size, 0);
-        }
+    if (size == 0) {
         return 0;
     }
 
-    if (_ring_mode == RingMode::Dropping) {
-        on_drop_mode();
-        note_write(size, 0);
+    // _accepting gates against stop(); the ring itself is process-lifetime.
+    if (!_accepting.load(std::memory_order_acquire) || !_ringbuf || data == nullptr) {
+        _win_bytes_drop.fetch_add(static_cast<uint32_t>(size), std::memory_order_relaxed);
+        return 0;
+    }
+
+    if (_ring_mode.load(std::memory_order_relaxed) == RingMode::Dropping) {
+        // Ring was full: resume only once the writer has drained below the cushion.
+        if (ring_bytes_used() <= kPrefetchBytes) {
+            _ring_mode.store(RingMode::Processing, std::memory_order_relaxed);
+        }
+        _win_bytes_drop.fetch_add(static_cast<uint32_t>(size), std::memory_order_relaxed);
         return 0;
     }
 
     if (xRingbufferSend(_ringbuf.get(), data, size, 0) != pdTRUE) {
-        _ring_mode = RingMode::Dropping;
-        note_write(size, 0);
+        _ring_mode.store(RingMode::Dropping, std::memory_order_relaxed);
+        _win_bytes_drop.fetch_add(static_cast<uint32_t>(size), std::memory_order_relaxed);
         return 0;
     }
 
-    maybe_finish_prefetch();
-    note_write(size, size);
+    _win_bytes_in.fetch_add(static_cast<uint32_t>(size), std::memory_order_relaxed);
+
+    // Wake the writer once the cushion is filled (Prefetching → Processing).
+    if (_ring_mode.load(std::memory_order_relaxed) == RingMode::Prefetching &&
+        ring_bytes_used() >= kPrefetchBytes) {
+        _ring_mode.store(RingMode::Processing, std::memory_order_relaxed);
+        (void)xSemaphoreGive(_wake_sem.get());
+    }
     return size;
 }
 

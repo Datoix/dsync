@@ -1,7 +1,6 @@
 #include "bt_sink.hpp"
 
-#include <cstdio>
-
+#include "bt_bda.hpp"
 #include "esp_bt.h"
 #include "esp_bt_device.h"
 #include "esp_bt_main.h"
@@ -15,23 +14,6 @@ namespace dsync::bt {
 namespace {
 
 constexpr char TAG[] = "bt_ctrl";
-
-char *bda2str (const uint8_t *bda, char *str, size_t size) {
-    if (!bda || !str || size < 18) {
-        return nullptr;
-    }
-    std::snprintf(
-        str,
-        size,
-        "%02x:%02x:%02x:%02x:%02x:%02x",
-        bda[0],
-        bda[1],
-        bda[2],
-        bda[3],
-        bda[4],
-        bda[5]);
-    return str;
-}
 
 }  // namespace
 
@@ -84,6 +66,11 @@ void Sink::log_bd_addr () {
 }
 
 esp_err_t Sink::init_controller () {
+    // Bluedroid warns once per lost RTP burst ("Sequence numbers error"). On a
+    // lossy link that floods the UART from the BT task and steals time from
+    // audio, so keep that tag at ERROR.
+    esp_log_level_set("BT_APPL", ESP_LOG_ERROR);
+
     ESP_RETURN_ON_ERROR(init_nvs(), TAG, "nvs");
     ESP_RETURN_ON_ERROR(enable_controller(), TAG, "controller");
     ESP_RETURN_ON_ERROR(enable_bluedroid(), TAG, "bluedroid");

@@ -31,6 +31,11 @@ Connection / audio events go: `a2d_cb` → work queue → `bt_work` → open/sta
 ## Notes
 
 - One I2S owner (`Output`); BT never drives the DAC directly.
-- A2DP data callback only enqueues (non-blocking).
+- A2DP data callback only enqueues: no blocking and no logging. Throughput stats
+  are emitted by the `i2s_wr` task.
+- `Output` allocates its I2S channel / ring / writer task once and keeps them for
+  the process lifetime; shared state is `std::atomic`, so teardown can never race
+  the data callback.
+- Ring size and playback cushion are Kconfig knobs under *dsync audio*.
 - Internal SBC decode (`BT_A2DP_USE_EXTERNAL_CODEC` off).
 - Reference: IDF 6.1 `a2dp_sink_stream`.
