@@ -51,3 +51,4 @@ Laptops: after pairing, select **dsync** as the system sound output. Windows may
 - [HARDWARE.md](docs/HARDWARE.md) — wiring, mode pins, reserved pins
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — components and audio path
 - [ROADMAP.md](docs/ROADMAP.md) — SD, OLED, PCB
+- [AGENTS.md](AGENTS.md) — agent guide (build, guardrails, conventions); skills under `.agents/skills/`
